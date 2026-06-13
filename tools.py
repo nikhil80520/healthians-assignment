@@ -162,6 +162,27 @@ async def book_appointment(name: str, phone: str, city: str, date: str, test_or_
                 "message": f"Sorry, we currently don't serve in '{city}'. We are available in: {', '.join(supported_cities[:10])}... and {len(supported_cities) - 10}+ more cities.",
             }
 
+        # Check if the requested package exists (if it sounds like a package)
+        test_lower = test_or_package.lower()
+        if "checkup" in test_lower or "package" in test_lower or "care" in test_lower:
+            result = await db.execute(select(Package.name).where(Package.is_active == True))
+            available_packages = [p.lower() for p in result.scalars().all()]
+            
+            # Simple substring match
+            matched = any(test_lower in pkg or pkg in test_lower for pkg in available_packages)
+            
+            if not matched:
+                return {
+                    "booking_id": None,
+                    "patient_name": name,
+                    "phone": phone,
+                    "city": city,
+                    "date": date,
+                    "test_or_package": test_or_package,
+                    "status": "failed",
+                    "message": f"The package '{test_or_package}' does not exist in our catalog. Please use the get_packages tool to find available packages (e.g. 'Smart Full Body Checkup').",
+                }
+
     try:
         parsed_date = None
         for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%d %B %Y", "%d %b %Y"):
