@@ -1,44 +1,53 @@
 """
-routes/chat.py — Chat API Endpoint
-POST /api/v1/chat — Main conversation endpoint for the Healthians AI assistant.
+chat.py — Chat Endpoint Route
 """
 
-from __future__ import annotations
-
+import json
 import logging
+from fastapi import APIRouter
+from fastapi.responses import StreamingResponse
 
-from fastapi import APIRouter, HTTPException
-
-from agent import process_message
-from models import ChatRequest, ChatResponse
+from agent import process_message, stream_message
+from models import ChatRequest
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(tags=["Chat"])
+router = APIRouter()
 
-
-@router.post("/chat", response_model=ChatResponse, summary="Chat with Healthians AI")
+@router.post("/chat")
 async def chat_endpoint(request: ChatRequest):
     """
-    Send a message to the Healthians AI assistant and receive a structured response.
-
-    - **user_message**: The user's chat message (required)
-    - **session_id**: Unique session identifier for conversation continuity (required)
-    - **phone_number**: Optional 10-digit phone number for fetching reports / context
-    - **language**: Preferred response language — 'en', 'hi', or 'auto' (default)
+    Standard synchronous chat endpoint.
+    Still works using the fallback method in agent.py.
     """
-    try:
-        response = await process_message(
-            user_message=request.user_message,
-            session_id=request.session_id,
-            phone=request.phone_number,
-            language=request.language,
-        )
-        return response
+    response = await process_message(
+        user_message=request.user_message,
+        session_id=request.session_id,
+        phone=request.phone_number,
+        language=request.language,
+    )
+    return response
 
-    except Exception as e:
-        logger.error(f"Unhandled error in chat_endpoint: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail="An unexpected error occurred. Please try again.",
-        )
+@router.post("/chat/stream")
+async def chat_stream_endpoint(request: ChatRequest):
+    """
+    Streaming chat endpoint using Server-Sent Events (SSE).
+    """
+    async def event_generator():
+        try:
+            async for chunk in stream_message(
+                user_message=request.user_message,
+                session_id=request.session_id,
+                phone=request.phone_number,
+                language=request.language,
+            ):
+                yield f"data: {json.dumps(chunk)}\n\n"
+        except Exception as e:
+            logger.error(f"Streaming error: {e}", exc_info=True)
+            error_chunk = {"type": "token", "content": "\n\n**Error**: An unexpected error occurred while generating the response."}
+            yield f"data: {json.dumps(error_chunk)}\n\n"
+            
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream"
+    )

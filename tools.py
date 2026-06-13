@@ -7,12 +7,17 @@ from __future__ import annotations
 import random
 import string
 from datetime import datetime
+import os
 import json
+from langchain_tavily import TavilySearch
 from sqlalchemy.future import select
 
 from config import settings
 from langchain_core.tools import tool
-from database import AsyncSessionLocal, ReferenceRange, City, Appointment, Report, FAQ, Escalation, Patient
+from langchain_aws import ChatBedrockConverse
+from pydantic import BaseModel, Field
+from typing import Literal
+from database import AsyncSessionLocal, City, Appointment, Report, FAQ, Escalation, Patient, Package
 
 
 def _generate_id(prefix: str, length: int = 8) -> str:
@@ -20,6 +25,75 @@ def _generate_id(prefix: str, length: int = 8) -> str:
     chars = string.ascii_uppercase + string.digits
     random_part = "".join(random.choices(chars, k=length))
     return f"{prefix}-{random_part}"
+
+class TriageClassification(BaseModel):
+    priority: Literal["emergency", "urgent", "normal"] = Field(
+        description="The medical triage priority level. Emergency = life threatening (call 112). Urgent = needs attention soon. Normal = routine queries."
+    )
+
+async def _classify_triage_priority(reason: str) -> str:
+    """Classify the priority of a medical reason using the LLM."""
+    kwargs = {
+        "model": settings.MODEL_NAME,
+        "region_name": settings.AWS_REGION,
+        "temperature": 0.0,
+    }
+    if settings.AWS_ACCESS_KEY_ID and settings.AWS_SECRET_ACCESS_KEY:
+        kwargs["aws_access_key_id"] = settings.AWS_ACCESS_KEY_ID
+        kwargs["aws_secret_access_key"] = settings.AWS_SECRET_ACCESS_KEY
+        
+    llm = ChatBedrockConverse(**kwargs)
+    structured_llm = llm.with_structured_output(TriageClassification)
+    
+    prompt = f"Classify the following medical query into 'emergency', 'urgent', or 'normal' priority based on standard medical triage:\n\nQuery: {reason}"
+    
+    try:
+        result = await structured_llm.ainvoke(prompt)
+        return result.priority
+    except Exception as e:
+        print(f"Failed to classify triage: {e}")
+        return "urgent" # Safe fallback
+
+
+@tool
+async def get_packages(category: str = "", max_price: int = 0, popular_only: bool = False) -> dict:
+    """
+    Fetch available health packages from Healthians catalog.
+    Use this when user asks about packages, prices, or wants recommendations.
+    
+    Args:
+        category: Filter by category - "full_body", "diabetes", "heart", "thyroid", "women", "senior". Use empty string for all.
+        max_price: Maximum budget in INR. Use 0 for no limit.
+        popular_only: If True, return only popular/top-selling packages.
+    """
+    async with AsyncSessionLocal() as db:
+        query = select(Package).where(Package.is_active == True)
+        
+        if category:
+            query = query.where(Package.category.ilike(f"%{category}%"))
+        if max_price > 0:
+            query = query.where(Package.price <= max_price)
+        if popular_only:
+            query = query.where(Package.popular == True)
+            
+        result = await db.execute(query.order_by(Package.price))
+        packages = result.scalars().all()
+        
+    return {
+        "packages": [
+            {
+                "name": p.name,
+                "tests": p.test_count,
+                "price": f"₹{p.price}",
+                "mrp": f"₹{p.mrp}",
+                "tat": p.tat,
+                "savings": f"₹{p.mrp - p.price}",
+            }
+            for p in packages
+        ],
+        "total": len(packages),
+        "filters_applied": {"category": category, "max_price": max_price}
+    }
 
 
 @tool
@@ -32,84 +106,29 @@ async def explain_report(test_name: str, value: float) -> dict:
         test_name: The name of the test (e.g., 'HbA1c', 'Vitamin D', 'TSH').
         value: The numeric value of the test result.
     """
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(select(ReferenceRange))
-        rows = result.scalars().all()
-        ranges = {row.test_name: json.loads(row.data) for row in rows}
-
-    # Normalize test name (case-insensitive lookup)
-    matched_test = None
-    for key in ranges:
-        if key.lower() == test_name.strip().lower():
-            matched_test = key
-            break
-
-    if not matched_test:
+    api_key = os.getenv("TAVILY_API_KEY", "")
+    os.environ["TAVILY_API_KEY"] = api_key
+    
+    query = f"What is the standard medical reference range and normal values for the '{test_name}' lab test?"
+    
+    try:
+        search = TavilySearch(max_results=2)
+        # We can just call ainvoke to do the async fetch
+        results = await search.ainvoke({"query": query})
+        
         return {
             "test_name": test_name,
             "value": value,
-            "unit": "N/A",
-            "reference_range": "Not available",
-            "status": "unknown",
-            "explanation": f"Reference range for '{test_name}' is not in our database. Please consult your doctor for interpretation.",
-            "recommendation": "Show this report to your healthcare provider for proper evaluation.",
-            "disclaimer": "This is for informational purposes only. Please consult your doctor for medical advice.",
+            "tavily_search_result": results,
+            "instruction": "Using the tavily_search_result, explain if the user's value is low, normal, or high. Provide a helpful explanation and always add a disclaimer to consult a doctor."
         }
-
-    ref = ranges[matched_test]
-    unit = ref["unit"]
-    status = "normal"
-    explanation = ""
-    recommendation = ""
-
-    # --- Determine status based on test-specific logic ---
-    for range_name, val_range in ref.items():
-        if range_name == "unit":
-            continue
-        if isinstance(val_range, (list, tuple)) and len(val_range) == 2:
-            low, high = val_range
-            if isinstance(low, (int, float)) and isinstance(high, (int, float)):
-                if low <= value <= high:
-                    if "normal" in range_name:
-                        status = "normal"
-                    elif "low" in range_name:
-                        status = "low"
-                    elif "high" in range_name or "elevated" in range_name:
-                        status = "high"
-                    elif "borderline" in range_name or "prediabetic" in range_name or "insufficient" in range_name:
-                        status = "borderline"
-                    elif "deficient" in range_name:
-                        status = "low"
-                    elif "diabetic" in range_name or "critical" in range_name:
-                        status = "high"
-                    else:
-                        status = "borderline"
-
-                    explanation = f"Your {matched_test} is {value} {unit} ({range_name.replace('_', ' ')})."
-                    recommendation = "Consult your doctor for personalized advice." if status != "normal" else "Your levels look good. Continue healthy habits."
-                    break
-
-    if not explanation:
-        explanation = f"Your {matched_test} is {value} {unit}. Please consult your doctor for interpretation."
-        recommendation = "Show this report to your healthcare provider."
-
-    # Build reference range string
-    range_parts = []
-    for k, v in ref.items():
-        if k != "unit" and isinstance(v, (list, tuple)):
-            range_parts.append(f"{k.replace('_', ' ')}: {v[0]}-{v[1]} {unit}")
-    reference_range_str = " | ".join(range_parts) if range_parts else "Consult lab report"
-
-    return {
-        "test_name": matched_test,
-        "value": value,
-        "unit": unit,
-        "reference_range": reference_range_str,
-        "status": status,
-        "explanation": explanation,
-        "recommendation": recommendation,
-        "disclaimer": "This is for informational purposes only. Please consult your doctor for medical advice.",
-    }
+    except Exception as e:
+        return {
+            "test_name": test_name,
+            "value": value,
+            "error": f"Failed to search for reference range: {str(e)}",
+            "instruction": "Please inform the user that you couldn't fetch the reference range online right now, and they should consult their doctor."
+        }
 
 
 @tool
@@ -307,42 +326,29 @@ async def answer_faq(question: str) -> dict:
 async def escalate_to_doctor(name: str, phone: str, reason: str) -> dict:
     """
     Escalate a severe medical query or emergency to a doctor for a callback.
-    Use this when the user describes severe symptoms (e.g., chest pain) or asks to speak with a doctor.
+    YOU MUST ALWAYS CALL THIS TOOL when the user describes severe symptoms (e.g., chest pain) or asks to speak with a doctor. Do not just reply with text.
     
     Args:
-        name: The patient's full name.
-        phone: The patient's 10-digit phone number.
-        reason: The medical reason or symptoms.
+        reason: The medical reason or symptoms (REQUIRED).
+        name: The patient's full name (Optional, defaults to 'Unknown').
+        phone: The patient's 10-digit phone number (Optional, defaults to 'Unknown').
     """
-    emergency_keywords = [
-        "chest pain", "breathing difficulty", "breathless", "severe bleeding",
-        "unconscious", "stroke", "heart attack", "seizure", "accident",
-        "suicide", "overdose", "poisoning", "emergency",
-    ]
-    urgent_keywords = [
-        "severe", "high fever", "persistent", "worsening", "unbearable",
-        "blood in", "sudden", "swelling", "allergic reaction", "vomiting blood",
-    ]
+    priority = await _classify_triage_priority(reason)
 
-    reason_lower = reason.lower()
-
-    if any(kw in reason_lower for kw in emergency_keywords):
-        priority = "emergency"
+    if priority == "emergency":
         estimated_callback = "Within 15 minutes"
         message = (
             "🚨 EMERGENCY ESCALATION: Your case has been marked as EMERGENCY. "
             "A doctor will call you within 15 minutes. "
             "If this is a life-threatening situation, please call 112 (emergency) or go to the nearest hospital immediately."
         )
-    elif any(kw in reason_lower for kw in urgent_keywords):
-        priority = "urgent"
+    elif priority == "urgent":
         estimated_callback = "Within 1 hour"
         message = (
             "⚠️ URGENT: Your case has been marked as urgent. "
             "A doctor will call you within 1 hour. Please keep your phone reachable."
         )
     else:
-        priority = "normal"
         estimated_callback = "Within 4-6 hours"
         message = (
             "📋 Your case has been registered. A doctor will review your query and call you within 4-6 hours. "

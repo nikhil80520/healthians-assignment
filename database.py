@@ -7,7 +7,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import Column, Integer, String, Float, Text, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Float, Text, DateTime, ForeignKey, Boolean
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.future import select
@@ -27,6 +27,19 @@ Base = declarative_base()
 # ---------------------------------------------------------------------------
 # ORM Models
 # ---------------------------------------------------------------------------
+
+class Package(Base):
+    __tablename__ = "packages"
+    
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)
+    test_count = Column(Integer)
+    price = Column(Integer)
+    mrp = Column(Integer)
+    tat = Column(String)  # Turnaround time
+    category = Column(String)  # "full_body", "diabetes", "heart", etc.
+    is_active = Column(Boolean, default=True)
+    popular = Column(Boolean, default=False)  # For "top recommendations"
 
 class Patient(Base):
     __tablename__ = "patients"
@@ -93,12 +106,6 @@ class City(Base):
 
     name = Column(String, primary_key=True)
 
-class ReferenceRange(Base):
-    __tablename__ = "reference_ranges"
-
-    test_name = Column(String, primary_key=True)
-    data = Column(Text, nullable=False) # JSON string
-
 # ---------------------------------------------------------------------------
 # Database Initialization
 # ---------------------------------------------------------------------------
@@ -112,6 +119,21 @@ async def init_db():
 
     # 2. Seed Mock Data
     async with AsyncSessionLocal() as session:
+        # Seed Packages
+        result = await session.execute(select(Package))
+        if not result.scalars().first():
+            packages = [
+                ("Smart Full Body Checkup", 90, 1199, 5000, "24-48 hrs", "full_body", True),
+                ("Good Health Package", 65, 799, 3500, "24-48 hrs", "full_body", False),
+                ("Diabetes Care Package", 45, 699, 2800, "24-48 hrs", "diabetes", True),
+                ("Heart Care Package", 40, 899, 3200, "24-48 hrs", "heart", True),
+                ("Thyroid Care Package", 30, 599, 2000, "24-48 hrs", "thyroid", False),
+                ("Women's Health Package", 70, 1299, 5500, "24-48 hrs", "women", True),
+                ("Senior Citizen Package", 80, 1499, 6000, "24-48 hrs", "senior", True),
+            ]
+            for name, count, price, mrp, tat, category, popular in packages:
+                session.add(Package(name=name, test_count=count, price=price, mrp=mrp, tat=tat, category=category, popular=popular))
+
         # Seed FAQs
         result = await session.execute(select(FAQ))
         if not result.scalars().first():
@@ -162,18 +184,5 @@ async def init_db():
             cities = ["Delhi", "Gurgaon", "Noida", "Mumbai", "Bangalore", "Hyderabad", "Pune", "Chennai", "Kolkata", "Ahmedabad", "Jaipur", "Lucknow", "Chandigarh"]
             for city in cities:
                 session.add(City(name=city))
-
-        # Seed Reference Ranges (Fallback if empty)
-        result = await session.execute(select(ReferenceRange))
-        if not result.scalars().first():
-            ranges = {
-                "HbA1c": {"unit": "%", "normal": [4.0, 5.6], "prediabetic": [5.7, 6.4], "diabetic": [6.5, 15.0]},
-                "Fasting Blood Sugar": {"unit": "mg/dL", "normal": [70, 99], "prediabetic": [100, 125], "diabetic": [126, 300]},
-                "Vitamin D": {"unit": "ng/mL", "deficient": [0, 19.9], "insufficient": [20.0, 29.9], "sufficient": [30.0, 100.0], "critical": [100.1, 200.0]},
-                "TSH": {"unit": "mIU/L", "low": [0.01, 0.39], "normal": [0.4, 4.0], "high": [4.1, 100.0]},
-                "Total Cholesterol": {"unit": "mg/dL", "normal": [0, 199], "borderline": [200, 239], "high": [240, 500]}
-            }
-            for test_name, test_data in ranges.items():
-                session.add(ReferenceRange(test_name=test_name, data=json.dumps(test_data)))
 
         await session.commit()

@@ -8,7 +8,8 @@ Run:
 
 import uuid
 import streamlit as st
-from agent import process_message
+import asyncio
+from agent import process_message, stream_message
 
 
 # ---------------------------------------------------------------------------
@@ -422,26 +423,50 @@ if user_input:
     # Show user message immediately
     st.markdown(f'<div class="user-msg">{user_input}</div>', unsafe_allow_html=True)
 
-    # Call the AI agent
-    with st.spinner("🤔 Thinking..."):
-        phone = st.session_state.phone if len(st.session_state.phone) == 10 else None
+    # Call the AI agent with Streaming
+    phone = st.session_state.phone if len(st.session_state.phone) == 10 else None
+    
+    # Placeholder for the AI's response container
+    ai_container = st.container()
+    with ai_container:
+        badge_placeholder = st.empty()
+        text_placeholder = st.empty()
         
-        import asyncio
-        response = asyncio.run(process_message(
+    async def run_stream():
+        intent = "general_chat"
+        reply = ""
+        async for chunk in stream_message(
             user_message=user_input,
             session_id=st.session_state.session_id,
             phone=phone,
             language=st.session_state.language,
-        ))
+        ):
+            if chunk["type"] == "token":
+                reply += chunk["content"]
+                # Update UI smoothly
+                text_placeholder.markdown(f'<div class="ai-msg">{reply}▌</div>', unsafe_allow_html=True)
+            elif chunk["type"] == "tool_call":
+                intent = chunk["tools"][0]
+                badge_html = render_intent_badge(intent)
+                badge_placeholder.markdown(badge_html, unsafe_allow_html=True)
+                text_placeholder.markdown(f'<div class="ai-msg"><i>Running tool: {intent}...</i></div>', unsafe_allow_html=True)
+        return reply, intent
+                
+    reply, intent = asyncio.run(run_stream())
+    
+    # Final render
+    badge_html = render_intent_badge(intent)
+    badge_placeholder.markdown(badge_html, unsafe_allow_html=True)
+    text_placeholder.markdown(f'<div class="ai-msg">{reply}</div>', unsafe_allow_html=True)
 
     # Add AI response to history
     msg_idx = len(st.session_state.messages)
     st.session_state.messages.append({
         "role": "assistant",
-        "content": response.reply,
-        "intent": response.intent,
-        "data": response.data,
-        "followups": response.suggested_followups,
+        "content": reply,
+        "intent": intent,
+        "data": None, # Data is handled silently in DB now for simplicity
+        "followups": [],
         "idx": msg_idx,
     })
 
