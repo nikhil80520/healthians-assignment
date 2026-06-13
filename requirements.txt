@@ -1,0 +1,10 @@
+fastapi==0.115.12
+uvicorn==0.34.3
+boto3>=1.35.0
+python-dotenv==1.1.0
+pydantic==2.11.3
+streamlit>=1.45.0
+sqlalchemy>=2.0.0
+aiosqlite>=0.20.0
+langchain-core
+langchain-aws
